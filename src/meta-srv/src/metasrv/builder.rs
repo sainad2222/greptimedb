@@ -71,6 +71,7 @@ use crate::service::mailbox::MailboxRef;
 use crate::service::store::cached_kv::LeaderCachedKvBackend;
 use crate::state::State;
 use crate::table_meta_alloc::MetasrvPeerAllocator;
+use auth::{user_provider_from_option, UserProviderRef};
 
 // TODO(fys): try use derive_builder macro
 pub struct MetasrvBuilder {
@@ -84,6 +85,7 @@ pub struct MetasrvBuilder {
     node_manager: Option<NodeManagerRef>,
     plugins: Option<Plugins>,
     table_metadata_allocator: Option<TableMetadataAllocatorRef>,
+    user_provider: Option<UserProviderRef>,
 }
 
 impl MetasrvBuilder {
@@ -99,6 +101,7 @@ impl MetasrvBuilder {
             node_manager: None,
             plugins: None,
             table_metadata_allocator: None,
+            user_provider: None,
         }
     }
 
@@ -158,6 +161,11 @@ impl MetasrvBuilder {
         self
     }
 
+    pub fn user_provider(mut self, user_provider: UserProviderRef) -> Self {
+        self.user_provider = Some(user_provider);
+        self
+    }
+
     pub async fn build(self) -> Result<Metasrv> {
         let started = Arc::new(AtomicBool::new(false));
 
@@ -172,9 +180,37 @@ impl MetasrvBuilder {
             node_manager,
             plugins,
             table_metadata_allocator,
+            user_provider,
         } = self;
 
         let options = options.unwrap_or_default();
+
+        let user_provider = match user_provider {
+            Some(provider) => Some(provider),
+            None => {
+                if let Some(user_provider_opts) = &options.user_provider {
+                    // Convert metasrv UserProviderOptions to auth UserProviderOptions
+                    // This is a bit of a hack, ideally these would be the same struct
+                    // or there would be a From implementation.
+                    let auth_opts = auth::user_provider::UserProviderOptions {
+                        backend: match user_provider_opts.backend {
+                            crate::metasrv::UserProviderBackend::Static => {
+                                auth::user_provider::UserProviderBackend::Static
+                            }
+                        },
+                        user_file_path: user_provider_opts.user_file_path.clone(),
+                    };
+                    user_provider_from_option(&auth_opts).await.map_err(|e| {
+                        error::BuildUserProviderSnafu {
+                            reason: e.to_string(),
+                        }
+                        .build()
+                    })?
+                } else {
+                    None
+                }
+            }
+        };
 
         let kv_backend = kv_backend.unwrap_or_else(|| Arc::new(MemoryKvBackend::new()));
         let in_memory = in_memory.unwrap_or_else(|| Arc::new(MemoryKvBackend::new()));
@@ -467,6 +503,7 @@ impl MetasrvBuilder {
             cache_invalidator,
             leader_region_registry,
             wal_prune_ticker,
+            user_provider,
         })
     }
 }

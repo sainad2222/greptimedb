@@ -24,6 +24,9 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use auth::{Identity, Password, UserProviderRef};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use tonic::body::BoxBody;
@@ -31,6 +34,45 @@ use tonic::codegen::{empty_body, http, BoxFuture, Service};
 use tonic::server::NamedService;
 
 use crate::metasrv::Metasrv;
+
+const DEFAULT_CATALOG: &str = "greptime";
+const DEFAULT_SCHEMA: &str = "metasrv";
+
+struct HttpAuth;
+
+impl HttpAuth {
+    fn parse_basic_auth<T>(req: &http::Request<T>) -> Option<(String, String)> {
+        req.headers()
+            .get(http::header::AUTHORIZATION)
+            .and_then(|header| header.to_str().ok())
+            .and_then(|header| {
+                if header.starts_with("Basic ") {
+                    let credentials = header.trim_start_matches("Basic ");
+                    BASE64_STANDARD.decode(credentials).ok().and_then(|bytes| {
+                        String::from_utf8(bytes).ok().and_then(|s| {
+                            let mut parts = s.splitn(2, ':');
+                            let username = parts.next().map(String::from);
+                            let password = parts.next().map(String::from);
+                            username.zip(password)
+                        })
+                    })
+                } else {
+                    None
+                }
+            })
+    }
+
+    fn unauthorized_response() -> Result<http::Response<BoxBody>, Infallible> {
+        Ok(http::Response::builder()
+            .status(http::StatusCode::UNAUTHORIZED)
+            .header(
+                http::header::WWW_AUTHENTICATE,
+                "Basic realm=\"metasrv\"",
+            )
+            .body(empty_body())
+            .unwrap())
+    }
+}
 
 pub fn make_admin_service(metasrv: Arc<Metasrv>) -> Admin {
     let router = Router::new().route("/health", health::HealthHandler);
@@ -64,7 +106,7 @@ pub fn make_admin_service(metasrv: Arc<Metasrv>) -> Admin {
     );
     let router = Router::nest("/admin", router);
 
-    Admin::new(router)
+    Admin::new(router, metasrv.user_provider())
 }
 
 #[async_trait::async_trait]
@@ -83,12 +125,14 @@ where
     Self: Send,
 {
     router: Arc<Router>,
+    user_provider: Option<UserProviderRef>,
 }
 
 impl Admin {
-    pub fn new(router: Router) -> Self {
+    pub fn new(router: Router, user_provider: Option<UserProviderRef>) -> Self {
         Self {
             router: Arc::new(router),
+            user_provider,
         }
     }
 }
@@ -111,6 +155,30 @@ where
 
     fn call(&mut self, req: http::Request<T>) -> Self::Future {
         let router = self.router.clone();
+        let user_provider = self.user_provider.clone();
+
+        if let Some(user_provider) = user_provider {
+            match HttpAuth::parse_basic_auth(&req) {
+                Some((username, password)) => {
+                    let user_info = user_provider.auth(
+                        &Identity::UserId(&username, None),
+                        &Password::PlainText(password.into()),
+                        DEFAULT_CATALOG,
+                        DEFAULT_SCHEMA,
+                    );
+
+                    if user_info.is_err() {
+                        return Box::pin(async { HttpAuth::unauthorized_response().await });
+                    }
+                }
+                None => {
+                    // No auth header, but user provider is configured
+                    return Box::pin(async { HttpAuth::unauthorized_response().await });
+                }
+            }
+        }
+
+        // Proceed with the request if authentication is not configured or successful
         let query_params = req
             .uri()
             .query()
@@ -202,6 +270,7 @@ fn boxed(body: String) -> BoxBody {
 
 #[cfg(test)]
 mod tests {
+    use auth::{UserProvider, UserProviderRef};
     use common_meta::kv_backend::memory::MemoryKvBackend;
     use common_meta::kv_backend::KvBackendRef;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -411,5 +480,222 @@ mod tests {
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains(r#"{"enabled":false}"#));
         assert!(response.contains("200 OK"));
+    }
+
+    #[test]
+    fn test_parse_basic_auth_valid() {
+        let mut req = http::Request::new(());
+        req.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Basic dXNlcjpwYXNz"), // user:pass
+        );
+        assert_eq!(
+            HttpAuth::parse_basic_auth(&req),
+            Some(("user".to_string(), "pass".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_basic_auth_no_header() {
+        let req = http::Request::new(());
+        assert_eq!(HttpAuth::parse_basic_auth(&req), None);
+    }
+
+    #[test]
+    fn test_parse_basic_auth_non_basic() {
+        let mut req = http::Request::new(());
+        req.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer token"),
+        );
+        assert_eq!(HttpAuth::parse_basic_auth(&req), None);
+    }
+
+    #[test]
+    fn test_parse_basic_auth_malformed_credentials() {
+        let mut req = http::Request::new(());
+        req.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Basic dXNlcjpwYXNzCg=="), // "user:pass\n" (invalid char)
+        );
+        assert_eq!(HttpAuth::parse_basic_auth(&req), None);
+
+        req.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Basic invalidbase64"),
+        );
+        assert_eq!(HttpAuth::parse_basic_auth(&req), None);
+    }
+
+    #[test]
+    fn test_unauthorized_response() {
+        let res = HttpAuth::unauthorized_response().unwrap();
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            res.headers().get(http::header::WWW_AUTHENTICATE).unwrap(),
+            "Basic realm=\"metasrv\""
+        );
+    }
+
+    // Mock UserProvider for integration tests
+    #[derive(Clone)]
+    struct MockUserProvider {
+        should_succeed: bool,
+        expected_user: String,
+        expected_pass: String,
+    }
+
+    impl UserProvider for MockUserProvider {
+        fn auth(
+            &self,
+            user: &Identity,
+            password: &Password,
+            _catalog: &str,
+            _schema: &str,
+        ) -> auth::error::Result<auth::UserInfoRef> {
+            let username = match user {
+                Identity::UserId(name, _) => name,
+                _ => return Err(auth::error::UnsupportedAuthTypeSnafu {}.build()),
+            };
+
+            let pass_str = match password {
+                Password::PlainText(p) => p,
+                _ => return Err(auth::error::UnsupportedAuthTypeSnafu {}.build()),
+            };
+
+            if self.should_succeed && username == &self.expected_user && pass_str == &self.expected_pass
+            {
+                Ok(Arc::new(auth::UserInfo::new(username.clone(), None)))
+            } else {
+                Err(auth::error::PasswordIncorrectSnafu {
+                    user: username.to_string(),
+                }
+                .build())
+            }
+        }
+
+        fn get_user_info(&self, _user: &Identity) -> auth::error::Result<auth::UserInfoRef> {
+            unimplemented!()
+        }
+    }
+
+    async fn build_test_admin_service(
+        user_provider: Option<UserProviderRef>,
+    ) -> Admin {
+        let router = Router::new().route("/test", MockOkHandler);
+        let router = Router::nest("/admin", router);
+        Admin::new(router, user_provider)
+    }
+
+    #[tokio::test]
+    async fn test_admin_auth_no_provider() {
+        let mut admin_service = build_test_admin_service(None).await;
+        let req = http::Request::builder()
+            .uri("/admin/test")
+            .method(http::Method::GET)
+            .body(())
+            .unwrap();
+        let res = admin_service.call(req).await.unwrap();
+        assert_eq!(res.status(), http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_admin_auth_provider_no_creds() {
+        let mock_provider = Arc::new(MockUserProvider {
+            should_succeed: true,
+            expected_user: "testuser".to_string(),
+            expected_pass: "testpass".to_string(),
+        });
+        let mut admin_service = build_test_admin_service(Some(mock_provider)).await;
+        let req = http::Request::builder()
+            .uri("/admin/test")
+            .method(http::Method::GET)
+            .body(())
+            .unwrap();
+        let res = admin_service.call(req).await.unwrap();
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_admin_auth_provider_invalid_creds() {
+        let mock_provider = Arc::new(MockUserProvider {
+            should_succeed: false, // Simulate auth failure
+            expected_user: "testuser".to_string(),
+            expected_pass: "testpass".to_string(),
+        });
+        let mut admin_service = build_test_admin_service(Some(mock_provider)).await;
+        let req = http::Request::builder()
+            .uri("/admin/test")
+            .method(http::Method::GET)
+            .header(
+                http::header::AUTHORIZATION,
+                "Basic d3JvbmdVc2VyOndyb25nUGFzcw==", // wrongUser:wrongPass
+            )
+            .body(())
+            .unwrap();
+        let res = admin_service.call(req).await.unwrap();
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_admin_auth_provider_correct_creds_auth_fail() {
+        // This test ensures that even if HttpAuth parses creds correctly,
+        // if the UserProvider fails auth, it's still 401.
+        let mock_provider = Arc::new(MockUserProvider {
+            should_succeed: false, // Explicitly make UserProvider fail
+            expected_user: "testuser".to_string(),
+            expected_pass: "testpass".to_string(),
+        });
+        let mut admin_service = build_test_admin_service(Some(mock_provider)).await;
+        let req = http::Request::builder()
+            .uri("/admin/test")
+            .method(http::Method::GET)
+            .header(
+                http::header::AUTHORIZATION,
+                "Basic dGVzdHVzZXI6dGVzdHBhc3M=", // testuser:testpass
+            )
+            .body(())
+            .unwrap();
+        let res = admin_service.call(req).await.unwrap();
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_admin_auth_provider_valid_creds() {
+        let mock_provider = Arc::new(MockUserProvider {
+            should_succeed: true,
+            expected_user: "testuser".to_string(),
+            expected_pass: "testpass".to_string(),
+        });
+        let mut admin_service = build_test_admin_service(Some(mock_provider)).await;
+        let req = http::Request::builder()
+            .uri("/admin/test")
+            .method(http::Method::GET)
+            .header(
+                http::header::AUTHORIZATION,
+                "Basic dGVzdHVzZXI6dGVzdHBhc3M=", // testuser:testpass
+            )
+            .body(())
+            .unwrap();
+        let res = admin_service.call(req).await.unwrap();
+        assert_eq!(res.status(), http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_admin_auth_provider_non_basic_auth() {
+        let mock_provider = Arc::new(MockUserProvider {
+            should_succeed: true,
+            expected_user: "testuser".to_string(),
+            expected_pass: "testpass".to_string(),
+        });
+        let mut admin_service = build_test_admin_service(Some(mock_provider)).await;
+        let req = http::Request::builder()
+            .uri("/admin/test")
+            .method(http::Method::GET)
+            .header(http::header::AUTHORIZATION, "Bearer sometoken")
+            .body(())
+            .unwrap();
+        let res = admin_service.call(req).await.unwrap();
+        assert_eq!(res.status(), http::StatusCode::UNAUTHORIZED);
     }
 }

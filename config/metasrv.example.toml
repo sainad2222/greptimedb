@@ -246,3 +246,18 @@ headers = { }
 ## The tokio console address.
 ## @toml2docs:none-default
 #+ tokio_console_addr = "127.0.0.1"
+
+## User provider options for authentication.
+## If this section is not present or commented out, authentication will be disabled for the Admin API.
+# [user_provider]
+## The backend type for the user provider.
+## Currently, only "Static" is supported, which reads users from a TOML file.
+# backend = "Static" # Or "StaticUserProvider", "FileUserProvider"
+## The path to the user definition file. This is required if `backend` is "Static".
+## The format of the users.toml file should be:
+## users = [
+##   { username = "user1", password_hash = "sha256_hex_encoded_password_hash_for_user1" },
+##   { username = "user2", password_hash = "another_sha256_hex_encoded_password_hash" },
+## ]
+## Note: The password_hash should be the SHA256 hash of the user's password, encoded as a hexadecimal string.
+# user_file_path = "/path/to/your/users.toml"

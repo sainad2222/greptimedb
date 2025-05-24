@@ -44,6 +44,7 @@ use common_procedure::ProcedureManagerRef;
 use common_telemetry::logging::{LoggingOptions, TracingOptions};
 use common_telemetry::{error, info, warn};
 use common_wal::config::MetasrvWalConfig;
+use auth::UserProviderRef;
 use serde::{Deserialize, Serialize};
 use servers::export_metrics::ExportMetricsOption;
 use servers::http::HttpOptions;
@@ -95,6 +96,28 @@ pub enum BackendImpl {
     #[cfg(feature = "mysql_kvbackend")]
     // MySql as metadata storage.
     MysqlStore,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserProviderBackend {
+    Static,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserProviderOptions {
+    pub backend: UserProviderBackend,
+    pub user_file_path: Option<String>,
+}
+
+impl Default for UserProviderOptions {
+    fn default() -> Self {
+        Self {
+            backend: UserProviderBackend::Static,
+            user_file_path: None,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -163,6 +186,8 @@ pub struct MetasrvOptions {
     #[cfg(feature = "pg_kvbackend")]
     /// Lock id for meta kv election. Only effect when using pg_kvbackend.
     pub meta_election_lock_id: u64,
+    /// The user provider options.
+    pub user_provider: Option<UserProviderOptions>,
     #[serde(with = "humantime_serde")]
     pub node_max_idle_time: Duration,
 }
@@ -203,6 +228,7 @@ impl fmt::Debug for MetasrvOptions {
         debug_struct.field("meta_election_lock_id", &self.meta_election_lock_id);
 
         debug_struct
+            .field("user_provider", &self.user_provider)
             .field("node_max_idle_time", &self.node_max_idle_time)
             .finish()
     }
@@ -249,6 +275,7 @@ impl Default for MetasrvOptions {
             meta_table_name: DEFAULT_META_TABLE_NAME.to_string(),
             #[cfg(feature = "pg_kvbackend")]
             meta_election_lock_id: DEFAULT_META_ELECTION_LOCK_ID,
+            user_provider: None,
             node_max_idle_time: Duration::from_secs(24 * 60 * 60),
         }
     }
@@ -466,6 +493,7 @@ pub struct Metasrv {
     cache_invalidator: CacheInvalidatorRef,
     leader_region_registry: LeaderRegionRegistryRef,
     wal_prune_ticker: Option<WalPruneTickerRef>,
+    user_provider: Option<UserProviderRef>,
 
     plugins: Plugins,
 }
@@ -721,6 +749,10 @@ impl Metasrv {
 
     pub fn plugins(&self) -> &Plugins {
         &self.plugins
+    }
+
+    pub fn user_provider(&self) -> Option<UserProviderRef> {
+        self.user_provider.clone()
     }
 
     #[inline]
